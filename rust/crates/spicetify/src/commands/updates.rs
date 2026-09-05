@@ -282,8 +282,10 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("spicetify-updates-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("fixture directory");
+        let launcher = root.join("Spotify.exe");
+        std::fs::write(&launcher, b"").expect("fixture executable");
         let cfg = crate::context::Config {
-            spotify_exec: Some(root.join("Spotify.exe")),
+            spotify_exec: Some(launcher),
             ..Default::default()
         };
         AppContext::from_config(root, &cfg).expect("fixture context")
