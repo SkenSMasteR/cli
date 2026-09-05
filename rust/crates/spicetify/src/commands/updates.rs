@@ -1,13 +1,16 @@
 // Spotify update handling.
 //
-// The client's self-updater fetches from a "desktop-update/v2/update" endpoint
+// On macOS and Linux the self-updater fetches from a "desktop-update/v2/update" endpoint
 // baked into the binary, so overwriting it with an equal-length dead string
 // makes the updater unreachable regardless of how the payload is fetched.
 // The patch is length-preserving, reversible and idempotent.
 //
-// Ported from the Go CLI (src/cmd/block-updates.go, update_policy.go), which
-// remains the reference implementation; the on-disk effects are identical so
-// either binary can read the other's state.
+// Windows protects the updater's staging directory instead: patching the signed
+// Spotify.dll invalidates its signature and the CEF launcher refuses to load it.
+
+#[cfg(windows)]
+#[path = "updates_windows.rs"]
+mod windows;
 
 #[cfg(target_os = "macos")]
 use std::path::Path;
@@ -90,9 +93,7 @@ fn patch_update_endpoint(raw: &mut [u8], block: bool) -> bool {
     changed
 }
 
-/// The client executable to patch. On macOS the launchable binary lives in
-/// the bundle's `MacOS` directory, not beside the resources the data dir points
-/// at, so resolve it rather than trusting the configured exec path.
+/// macOS uses the bundle's `MacOS` binary rather than the resource directory.
 fn spotify_binary(ctx: &AppContext) -> PathBuf {
     #[cfg(target_os = "macos")]
     {
@@ -104,12 +105,32 @@ fn spotify_binary(ctx: &AppContext) -> PathBuf {
     ctx.spotify_exec.clone()
 }
 
-/// Whether the installed binary currently has its updater neutered. Valid only
-/// while the endpoint string is stable: a future build that renames it would
-/// read as blocked here, the same assumption the patch itself relies on.
+/// A missing endpoint is unknown, not evidence that a block was applied.
 pub fn is_blocked(ctx: &AppContext) -> Result<bool> {
+    #[cfg(windows)]
+    {
+        let protection = windows::protection(ctx)?;
+        if windows::uses_staging(ctx) || protection != windows::Protection::None {
+            return Ok(protection == windows::Protection::Blocked);
+        }
+    }
+    binary_is_blocked(ctx)
+}
+
+fn binary_is_blocked(ctx: &AppContext) -> Result<bool> {
     let raw = std::fs::read(spotify_binary(ctx))?;
-    Ok(!contains(&raw, ENDPOINT_LIVE.as_bytes()))
+    update_block_state(&raw)
+}
+
+fn update_block_state(raw: &[u8]) -> Result<bool> {
+    if contains(raw, ENDPOINT_LIVE.as_bytes()) {
+        return Ok(false);
+    }
+    anyhow::ensure!(
+        contains(raw, ENDPOINT_BLOCKED.as_bytes()),
+        "Spotify update endpoint not found; cannot determine or change update blocking"
+    );
+    Ok(true)
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -170,14 +191,23 @@ pub(crate) fn reassert_block(ctx: &AppContext) {
             }
         }
         Err(e) => {
-            tracing::warn!(error = %e, "cannot read the update policy from the Spotify binary");
+            tracing::warn!(error = %e, "cannot determine Spotify update protection");
         }
     }
 }
 
 pub(crate) fn set_blocked(ctx: &AppContext, block: bool) -> Result<()> {
+    #[cfg(windows)]
+    if windows::uses_staging(ctx) || windows::protection(ctx)? != windows::Protection::None {
+        return windows::set_blocked(ctx, block);
+    }
+    set_binary_blocked(ctx, block)
+}
+
+fn set_binary_blocked(ctx: &AppContext, block: bool) -> Result<()> {
     let path = spotify_binary(ctx);
     let mut raw = std::fs::read(&path)?;
+    let _ = update_block_state(&raw)?;
     let original = raw.clone();
 
     if !patch_update_endpoint(&mut raw, block) {
@@ -246,6 +276,45 @@ mod tests {
 
     fn image(endpoint: &str) -> Vec<u8> {
         format!("....https://x/{endpoint}?q=1....").into_bytes()
+    }
+
+    fn fixture(name: &str) -> AppContext {
+        let root =
+            std::env::temp_dir().join(format!("spicetify-updates-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("fixture directory");
+        let cfg = crate::context::Config {
+            spotify_exec: Some(root.join("Spotify.exe")),
+            ..Default::default()
+        };
+        AppContext::from_config(root, &cfg).expect("fixture context")
+    }
+
+    #[test]
+    fn missing_endpoints_are_unknown_not_blocked_or_already_allowed() {
+        let ctx = fixture("unknown");
+        std::fs::write(&ctx.spotify_exec, b"launcher without an updater").expect("launcher");
+        assert!(binary_is_blocked(&ctx).is_err(), "absence of the live endpoint is not a block");
+        assert!(
+            set_binary_blocked(&ctx, true).is_err(),
+            "must not claim an unknown binary is blocked"
+        );
+        assert!(
+            set_binary_blocked(&ctx, false).is_err(),
+            "must not claim an unknown binary is allowed"
+        );
+        std::fs::remove_dir_all(&ctx.config_root).expect("clean fixture");
+    }
+
+    #[test]
+    fn status_requires_a_blocked_marker_and_no_live_endpoints() {
+        let ctx = fixture("status");
+        std::fs::write(&ctx.spotify_exec, image(ENDPOINT_BLOCKED)).expect("blocked binary");
+        assert!(binary_is_blocked(&ctx).expect("recognized binary"));
+        let mut mixed = image(ENDPOINT_BLOCKED);
+        mixed.extend_from_slice(&image(ENDPOINT_LIVE));
+        std::fs::write(&ctx.spotify_exec, mixed).expect("partially blocked binary");
+        assert!(!binary_is_blocked(&ctx).expect("recognized binary"));
+        std::fs::remove_dir_all(&ctx.config_root).expect("clean fixture");
     }
 
     #[test]
