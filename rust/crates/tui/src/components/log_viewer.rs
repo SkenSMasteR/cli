@@ -71,7 +71,7 @@ impl LogViewer {
                     Level::INFO => (Color::Rgb(0x66, 0x99, 0xCC), Color::Rgb(0xD4, 0xD4, 0xD4)),
                     Level::DEBUG | Level::TRACE => (TEXT_MUTED, TEXT_MUTED),
                 };
-                let level_str = format!("{:<5}", entry.level.as_str());
+                let level_str = format!("{} ", entry.level.as_str());
                 Line::from(vec![
                     Span::styled(level_str, Style::default().fg(level_color)),
                     Span::styled(&entry.message, Style::default().fg(msg_color)),
